@@ -652,10 +652,11 @@ if __name__ == "__main__":
         # 슬래시 커맨드 정의
         @bot.tree.command(name="서버입장생성", description="서버 입장 안내 임베드와 역할 부여 버튼을 생성합니다.")
         @app_commands.describe(
-            role="입장 시 부여할 역할을 선택하세요."
+            role="입장 시 부여할 역할을 선택하세요.",
+            channel="안내 메시지를 생성할 채널을 선택하세요. (지정하지 않으면 현재 채널)"
         )
         @app_commands.default_permissions(administrator=True)
-        async def server_entry_setup(interaction: discord.Interaction, role: discord.Role):
+        async def server_entry_setup(interaction: discord.Interaction, role: discord.Role, channel: Optional[discord.TextChannel] = None):
             # guild 체크를 가장 먼저 수행
             if interaction.guild is None:
                 await interaction.response.send_message("❌ 서버 내에서만 사용 가능한 명령어입니다.", ephemeral=True)
@@ -667,7 +668,7 @@ if __name__ == "__main__":
                 return
 
             try:
-                target_channel = interaction.channel
+                target_channel = channel if channel else interaction.channel
                 embed = discord.Embed(
                     title="👋 서버 입장 안내",
                     description="버튼을 클릭하시면 서버에 입장됩니다.",
