@@ -602,6 +602,49 @@ class LeaderboardView(discord.ui.View):
         self.page += 1
         await self.update_view(interaction)
 
+
+class SettingsGroup(app_commands.Group):
+    def __init__(self, bot):
+        super().__init__(name="설정", description="서버 설정을 관리합니다.")
+        self.bot = bot
+
+    @app_commands.command(name="로그채널", description="신규 유저 입장 로그 설정을 변경합니다.")
+    @app_commands.describe(
+        enabled="로그 전송 기능의 활성화 여부를 선택하세요.",
+        channel="로그를 전송할 채널을 선택하세요. (지정하지 않으면 자동 선택 또는 시스템 채널 사용)"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def set_welcome_log(self, interaction: discord.Interaction, enabled: bool, channel: Optional[discord.TextChannel] = None):
+        # guild 체크를 가장 먼저 수행
+        if interaction.guild is None:
+            await interaction.response.send_message("❌ 서버 내에서만 사용 가능한 명령어입니다.", ephemeral=True)
+            return
+
+        # 관리자 권한 확인
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 이 명령어는 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        guild_id = interaction.guild.id
+        channel_id = str(channel.id) if channel else None
+        success = await self.bot.update_guild_settings(guild_id, enabled, channel_id)
+        if success:
+            status_text = "활성화" if enabled else "비활성화"
+            if channel:
+                channel_mention = channel.mention
+            elif LOG_CHANNEL_ID and interaction.guild.get_channel(int(LOG_CHANNEL_ID)):
+                channel_mention = f"<#{LOG_CHANNEL_ID}> (env 기본)"
+            else:
+                channel_mention = "자동 선택 (환경설정 또는 시스템 채널)"
+            await interaction.response.send_message(
+                f"✅ **입장 로그 설정이 변경되었습니다.**\n"
+                f"• **상태**: {status_text}\n"
+                f"• **로그 채널**: {channel_mention}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message("❌ 설정 변경 중 오류가 발생했습니다. DB 로그를 확인해 주세요.", ephemeral=True)
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("[Critical] DISCORD_TOKEN is missing. Please set it in .env file.")
@@ -613,6 +656,7 @@ if __name__ == "__main__":
         intents.message_content = True
         
         bot = InviteTrackerBot(intents=intents)
+        bot.tree.add_command(SettingsGroup(bot))
 
         # 슬래시 커맨드 정의
         @bot.tree.command(name="서버입장생성", description="서버 입장 안내 임베드와 역할 부여 버튼을 생성합니다.")
@@ -683,43 +727,7 @@ if __name__ == "__main__":
                 except Exception:
                     pass
 
-        @bot.tree.command(name="입장로그설정", description="신규 유저 입장 로그 설정을 변경합니다.")
-        @app_commands.describe(
-            enabled="로그 전송 기능의 활성화 여부를 선택하세요.",
-            channel="로그를 전송할 채널을 선택하세요. (지정하지 않으면 env 설정 또는 기본 채널 사용)"
-        )
-        @app_commands.default_permissions(administrator=True)
-        async def set_welcome_log(interaction: discord.Interaction, enabled: bool, channel: Optional[discord.TextChannel] = None):
-            # guild 체크를 가장 먼저 수행
-            if interaction.guild is None:
-                await interaction.response.send_message("❌ 서버 내에서만 사용 가능한 명령어입니다.", ephemeral=True)
-                return
 
-            # 관리자 권한 확인
-            if not interaction.user.guild_permissions.administrator:
-                await interaction.response.send_message("❌ 이 명령어는 관리자만 사용할 수 있습니다.", ephemeral=True)
-                return
-
-            guild_id = interaction.guild.id
-            channel_id = str(channel.id) if channel else None
-            success = await bot.update_guild_settings(guild_id, enabled, channel_id)
-            if success:
-                status_text = "활성화" if enabled else "비활성화"
-                if channel:
-                    channel_mention = channel.mention
-                elif LOG_CHANNEL_ID and interaction.guild.get_channel(int(LOG_CHANNEL_ID)):
-                    channel_mention = f"<#{LOG_CHANNEL_ID}> (env 기본)"
-                else:
-                    channel_mention = "자동 선택 (환경설정 또는 시스템 채널)"
-                await interaction.response.send_message(
-                    f"✅ **입장 로그 설정이 변경되었습니다.**\n"
-                    f"• **상태**: {status_text}\n"
-                    f"• **로그 채널**: {channel_mention}",
-                    ephemeral=True
-                )
-            else:
-                await interaction.response.send_message("❌ 설정 변경 중 오류가 발생했습니다. DB 로그를 확인해 주세요.", ephemeral=True)
-            
         @bot.tree.command(name="초대순위", description="서버의 초대 순위(리더보드)를 확인합니다.")
         @app_commands.default_permissions(administrator=True)
         async def show_leaderboard(interaction: discord.Interaction):
