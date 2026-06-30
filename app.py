@@ -360,8 +360,10 @@ class InviteTrackerBot(discord.Client):
         if interaction.type == discord.InteractionType.component:
             custom_id = interaction.data.get("custom_id", "")
             if custom_id.startswith("entry_role:"):
+                parts = custom_id.split(":")
                 try:
-                    role_id = int(custom_id.split(":")[1])
+                    role_id = int(parts[1])
+                    remove_role_id = int(parts[2]) if len(parts) > 2 else 0
                 except ValueError:
                     return
                 
@@ -374,17 +376,42 @@ class InviteTrackerBot(discord.Client):
                     await interaction.response.send_message("❌ 설정된 역할을 서버에서 찾을 수 없습니다.", ephemeral=True)
                     return
                 
-                if role in interaction.user.roles:
+                # 추가할 역할이 이미 있고, 제거할 역할은 유저에게 없는 경우
+                has_target_role = role in interaction.user.roles
+                has_remove_role = False
+                if remove_role_id > 0:
+                    remove_role = guild.get_role(remove_role_id)
+                    if remove_role and remove_role in interaction.user.roles:
+                        has_remove_role = True
+
+                if has_target_role and not has_remove_role:
                     await interaction.response.send_message(" 이미 역할을 가지고 있습니다.", ephemeral=True)
                     return
                 
                 try:
-                    await interaction.user.add_roles(role)
-                    await interaction.response.send_message(f"✅ {role.name} 역할이 부여되었습니다. 서버 입장을 환영합니다!", ephemeral=True)
+                    roles_to_add = []
+                    roles_to_remove = []
+                    
+                    if not has_target_role:
+                        roles_to_add.append(role)
+                        
+                    removed_text = ""
+                    if remove_role_id > 0:
+                        remove_role = guild.get_role(remove_role_id)
+                        if remove_role and remove_role in interaction.user.roles:
+                            roles_to_remove.append(remove_role)
+                            removed_text = f", {remove_role.name} 역할이 제거되었습니다"
+                    
+                    if roles_to_add:
+                        await interaction.user.add_roles(*roles_to_add)
+                    if roles_to_remove:
+                        await interaction.user.remove_roles(*roles_to_remove)
+                        
+                    await interaction.response.send_message(f"✅ {role.name} 역할이 부여되었습니다{removed_text}. 서버 입장을 환영합니다!", ephemeral=True)
                 except discord.Forbidden:
-                    await interaction.response.send_message("❌ 봇에게 역할 부여 권한이 없습니다. (봇의 역할 순위가 해당 역할보다 높아야 합니다.)", ephemeral=True)
+                    await interaction.response.send_message("❌ 봇에게 역할 관리 권한이 없습니다. (봇의 역할 순위가 해당 역할들보다 높아야 합니다.)", ephemeral=True)
                 except Exception as e:
-                    await interaction.response.send_message(f"❌ 역할 부여 중 오류가 발생했습니다: {e}", ephemeral=True)
+                    await interaction.response.send_message(f"❌ 역할 처리 중 오류가 발생했습니다: {e}", ephemeral=True)
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         # 파라미터 변환 오류 (TransformerError)
@@ -653,10 +680,16 @@ if __name__ == "__main__":
         @bot.tree.command(name="서버입장생성", description="서버 입장 안내 임베드와 역할 부여 버튼을 생성합니다.")
         @app_commands.describe(
             role="입장 시 부여할 역할을 선택하세요.",
-            channel="안내 메시지를 생성할 채널을 선택하세요. (지정하지 않으면 현재 채널)"
+            channel="안내 메시지를 생성할 채널을 선택하세요. (지정하지 않으면 현재 채널)",
+            remove_role="입장 시 제거할 역할을 선택하세요. (선택사항)"
         )
         @app_commands.default_permissions(administrator=True)
-        async def server_entry_setup(interaction: discord.Interaction, role: discord.Role, channel: Optional[discord.TextChannel] = None):
+        async def server_entry_setup(
+            interaction: discord.Interaction, 
+            role: discord.Role, 
+            channel: Optional[discord.TextChannel] = None, 
+            remove_role: Optional[discord.Role] = None
+        ):
             # guild 체크를 가장 먼저 수행
             if interaction.guild is None:
                 await interaction.response.send_message("❌ 서버 내에서만 사용 가능한 명령어입니다.", ephemeral=True)
@@ -675,12 +708,17 @@ if __name__ == "__main__":
                     color=discord.Color.green()
                 )
                 
-                # 지속형 버튼을 위해 custom_id에 역할 ID를 포함
+                # 지속형 버튼을 위해 custom_id에 역할 ID 및 제거할 역할 ID를 포함
                 view = discord.ui.View(timeout=None)
+                
+                custom_id = f"entry_role:{role.id}"
+                if remove_role:
+                    custom_id += f":{remove_role.id}"
+                    
                 button = discord.ui.Button(
                     label="서버 입장",
                     style=discord.ButtonStyle.green,
-                    custom_id=f"entry_role:{role.id}"
+                    custom_id=custom_id
                 )
                 view.add_item(button)
                 
