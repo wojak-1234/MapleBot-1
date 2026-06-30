@@ -16,8 +16,6 @@ logger = logging.getLogger("InviteTrackerBot")
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID")
-LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
 GUILD_ID = os.getenv("SERVER_ID")
 
 DB_PATH = os.path.join(".venv", "files", "referrals.db")
@@ -485,17 +483,12 @@ class InviteTrackerBot(discord.Client):
                     if not settings["log_enabled"]:
                         print(f"[Info] Welcome log is disabled for guild {guild.id}")
                     else:
-                        # 채널 결정 (DB 설정 -> env 설정 -> 시스템 채널 -> 첫 번째 전송 가능 채널)
+                        # 채널 결정 (DB 설정 -> 시스템 채널 -> 첫 번째 전송 가능 채널)
                         channel = None
                         db_channel_id = settings.get("log_channel_id")
                         if db_channel_id:
                             try:
                                 channel = guild.get_channel(int(db_channel_id))
-                            except ValueError:
-                                pass
-                        if not channel and LOG_CHANNEL_ID:
-                            try:
-                                channel = guild.get_channel(int(LOG_CHANNEL_ID))
                             except ValueError:
                                 pass
                         if not channel:
@@ -632,10 +625,8 @@ class SettingsGroup(app_commands.Group):
             status_text = "활성화" if enabled else "비활성화"
             if channel:
                 channel_mention = channel.mention
-            elif LOG_CHANNEL_ID and interaction.guild.get_channel(int(LOG_CHANNEL_ID)):
-                channel_mention = f"<#{LOG_CHANNEL_ID}> (env 기본)"
             else:
-                channel_mention = "자동 선택 (환경설정 또는 시스템 채널)"
+                channel_mention = "자동 선택 (시스템 채널 등)"
             await interaction.response.send_message(
                 f"✅ **입장 로그 설정이 변경되었습니다.**\n"
                 f"• **상태**: {status_text}\n"
