@@ -491,6 +491,8 @@ class InviteTrackerBot(discord.Client):
 
         # 동시 입장 처리를 위해 전체 초대 분석 및 DB 업데이트 구간을 Lock으로 보호
         async with self.db_lock:
+            # 디스코드 API 서버에서 초대 코드 사용 횟수(uses)가 갱신되는 속도를 고려하여 1.5초간 대기합니다.
+            await asyncio.sleep(1.5)
             used_invite = None
             try:
                 # 멤버 가입 시점의 최신 초대 코드 가져오기
