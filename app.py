@@ -1,9 +1,8 @@
 import os
 import asyncio
-import sqlite3
 import logging
 from typing import Optional
-import aiosqlite
+import asyncpg
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -17,8 +16,8 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("SERVER_ID")
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 
-DB_PATH = os.path.join(".venv", "files", "referrals.db")
 
 class InviteTrackerBot(discord.Client):
     def __init__(self, **options):
@@ -30,16 +29,18 @@ class InviteTrackerBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.tree.on_error = self.on_tree_error
         self.synced = False
+        self.db_pool = None
 
     async def initialize_db(self):
-        """SQLite 데이터베이스 및 테이블을 초기화합니다."""
-        db_dir = os.path.dirname(DB_PATH)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
+        """Supabase PostgreSQL 데이터베이스 및 테이블을 초기화합니다."""
+        if not SUPABASE_DB_URL:
+            logger.critical("SUPABASE_DB_URL environment variable is missing!")
+            return
             
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("""
+            self.db_pool = await asyncpg.create_pool(SUPABASE_DB_URL)
+            async with self.db_pool.acquire() as conn:
+                await conn.execute("""
                     CREATE TABLE IF NOT EXISTS referrals (
                         guild_id TEXT,
                         user_id TEXT,
@@ -47,184 +48,180 @@ class InviteTrackerBot(discord.Client):
                         join_count INTEGER DEFAULT 0,
                         leave_count INTEGER DEFAULT 0,
                         PRIMARY KEY (guild_id, user_id, invite_code)
-                    )
-                """)
-                await db.execute("""
+                    );
                     CREATE TABLE IF NOT EXISTS joined_members (
                         guild_id TEXT,
                         user_id TEXT,
                         inviter_id TEXT,
                         invite_code TEXT,
                         PRIMARY KEY (guild_id, user_id)
-                    )
-                """)
-                await db.execute("""
+                    );
                     CREATE TABLE IF NOT EXISTS guild_settings (
                         guild_id TEXT PRIMARY KEY,
                         log_enabled INTEGER DEFAULT 1,
                         log_channel_id TEXT
-                    )
+                    );
                 """)
-                await db.commit()
-                print("[Info] SQLite Database & Tables initialized successfully.")
+                print("[Info] Supabase Database & Tables initialized successfully.")
         except Exception as e:
             logger.exception("Failed to initialize database")
 
     async def update_referrals_db(self, guild_id, member_id, inviter_id, invite_code):
-        """SQLite DB에 초대 횟수를 기록하고, 전체 누적 성공 횟수를 조회하여 반환합니다."""
+        """Supabase DB에 초대 횟수를 기록하고, 전체 누적 성공 횟수를 조회하여 반환합니다."""
+        if not self.db_pool:
+            return 0, 0, 0, inviter_id, invite_code, True
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # 이미 가입되어 있는지 확인
-                async with db.execute("""
-                    SELECT inviter_id, invite_code FROM joined_members WHERE guild_id = ? AND user_id = ?
-                """, (str(guild_id), str(member_id))) as cursor:
-                    row = await cursor.fetchone()
+            async with self.db_pool.acquire() as conn:
+                async with conn.transaction():
+                    # 이미 가입되어 있는지 확인
+                    row = await conn.fetchrow("""
+                        SELECT inviter_id, invite_code FROM joined_members WHERE guild_id = $1 AND user_id = $2
+                    """, str(guild_id), str(member_id))
+                    
                     if row:
-                        orig_inviter_id, orig_invite_code = row[0], row[1]
+                        orig_inviter_id, orig_invite_code = row['inviter_id'], row['invite_code']
                         
                         # 1. 동일한 초대자로 재입장한 경우
                         if str(orig_inviter_id) == str(inviter_id):
                             # 기존 초대자의 leave_count를 1 차감 (최소 0)
-                            await db.execute("""
+                            await conn.execute("""
                                 UPDATE referrals
                                 SET leave_count = CASE WHEN leave_count > 0 THEN leave_count - 1 ELSE 0 END
-                                WHERE guild_id = ? AND user_id = ? AND invite_code = ?
-                            """, (str(guild_id), str(orig_inviter_id), orig_invite_code))
-                            await db.commit()
+                                WHERE guild_id = $1 AND user_id = $2 AND invite_code = $3
+                            """, str(guild_id), str(orig_inviter_id), orig_invite_code)
 
-                            async with db.execute("""
-                                SELECT SUM(join_count), SUM(leave_count) FROM referrals
-                                WHERE guild_id = ? AND user_id = ?
-                            """, (str(guild_id), str(orig_inviter_id))) as cursor2:
-                                r = await cursor2.fetchone()
-                                joins = r[0] if (r and r[0] is not None) else 0
-                                leaves = r[1] if (r and r[1] is not None) else 0
-                                return joins - leaves, joins, leaves, orig_inviter_id, orig_invite_code, False
+                            r = await conn.fetchrow("""
+                                SELECT SUM(join_count) as joins, SUM(leave_count) as leaves FROM referrals
+                                WHERE guild_id = $1 AND user_id = $2
+                            """, str(guild_id), str(orig_inviter_id))
+                            joins = r['joins'] if (r and r['joins'] is not None) else 0
+                            leaves = r['leaves'] if (r and r['leaves'] is not None) else 0
+                            return joins - leaves, joins, leaves, orig_inviter_id, orig_invite_code, False
                         
                         # 2. 다른 초대자로 재입장한 경우 (초대 실적을 신규 초대자에게 이전)
                         else:
-                            # 기존 초대자의 실적 차감 (기존에 가입 및 퇴장 횟수가 올라가 있으므로 둘 다 1씩 차감하여 이전 기록을 무효화)
-                            await db.execute("""
+                            # 기존 초대자의 실적 차감
+                            await conn.execute("""
                                 UPDATE referrals
                                 SET join_count = CASE WHEN join_count > 0 THEN join_count - 1 ELSE 0 END,
                                     leave_count = CASE WHEN leave_count > 0 THEN leave_count - 1 ELSE 0 END
-                                WHERE guild_id = ? AND user_id = ? AND invite_code = ?
-                            """, (str(guild_id), str(orig_inviter_id), orig_invite_code))
+                                WHERE guild_id = $1 AND user_id = $2 AND invite_code = $3
+                            """, str(guild_id), str(orig_inviter_id), orig_invite_code)
 
                             # 신규 초대자의 join_count 1 증가
-                            await db.execute("""
+                            await conn.execute("""
                                 INSERT INTO referrals (guild_id, user_id, invite_code, join_count, leave_count)
-                                VALUES (?, ?, ?, 1, 0)
+                                VALUES ($1, $2, $3, 1, 0)
                                 ON CONFLICT(guild_id, user_id, invite_code)
-                                DO UPDATE SET join_count = join_count + 1
-                            """, (str(guild_id), str(inviter_id), invite_code))
+                                DO UPDATE SET join_count = referrals.join_count + 1
+                            """, str(guild_id), str(inviter_id), invite_code)
 
                             # 가입 정보 테이블 업데이트 (초대자를 신규 초대자로 갱신)
-                            await db.execute("""
+                            await conn.execute("""
                                 UPDATE joined_members
-                                SET inviter_id = ?, invite_code = ?
-                                WHERE guild_id = ? AND user_id = ?
-                            """, (str(inviter_id), invite_code, str(guild_id), str(member_id)))
-                            await db.commit()
+                                SET inviter_id = $1, invite_code = $2
+                                WHERE guild_id = $3 AND user_id = $4
+                            """, str(inviter_id), invite_code, str(guild_id), str(member_id))
 
-                            async with db.execute("""
-                                SELECT SUM(join_count), SUM(leave_count) FROM referrals
-                                WHERE guild_id = ? AND user_id = ?
-                            """, (str(guild_id), str(inviter_id))) as cursor2:
-                                r = await cursor2.fetchone()
-                                joins = r[0] if (r and r[0] is not None) else 0
-                                leaves = r[1] if (r and r[1] is not None) else 0
-                                return joins - leaves, joins, leaves, inviter_id, invite_code, True
+                            r = await conn.fetchrow("""
+                                SELECT SUM(join_count) as joins, SUM(leave_count) as leaves FROM referrals
+                                WHERE guild_id = $1 AND user_id = $2
+                            """, str(guild_id), str(inviter_id))
+                            joins = r['joins'] if (r and r['joins'] is not None) else 0
+                            leaves = r['leaves'] if (r and r['leaves'] is not None) else 0
+                            return joins - leaves, joins, leaves, inviter_id, invite_code, True
 
-                # 관계 기록 (최초 가입)
-                await db.execute("""
-                    INSERT OR REPLACE INTO joined_members (guild_id, user_id, inviter_id, invite_code)
-                    VALUES (?, ?, ?, ?)
-                """, (str(guild_id), str(member_id), str(inviter_id), invite_code))
+                    # 관계 기록 (최초 가입)
+                    await conn.execute("""
+                        INSERT INTO joined_members (guild_id, user_id, inviter_id, invite_code)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (guild_id, user_id)
+                        DO UPDATE SET inviter_id = EXCLUDED.inviter_id, invite_code = EXCLUDED.invite_code
+                    """, str(guild_id), str(member_id), str(inviter_id), invite_code)
 
-                # UPSERT를 통한 join_count 1 증가 처리
-                await db.execute("""
-                    INSERT INTO referrals (guild_id, user_id, invite_code, join_count, leave_count)
-                    VALUES (?, ?, ?, 1, 0)
-                    ON CONFLICT(guild_id, user_id, invite_code)
-                    DO UPDATE SET join_count = join_count + 1
-                """, (str(guild_id), str(inviter_id), invite_code))
-                await db.commit()
+                    # UPSERT를 통한 join_count 1 증가 처리
+                    await conn.execute("""
+                        INSERT INTO referrals (guild_id, user_id, invite_code, join_count, leave_count)
+                        VALUES ($1, $2, $3, 1, 0)
+                        ON CONFLICT(guild_id, user_id, invite_code)
+                        DO UPDATE SET join_count = referrals.join_count + 1
+                    """, str(guild_id), str(inviter_id), invite_code)
 
-                # 해당 초대자(user_id)의 모든 초대 링크의 누적 가입 인원 합산 조회
-                async with db.execute("""
-                    SELECT SUM(join_count), SUM(leave_count) FROM referrals
-                    WHERE guild_id = ? AND user_id = ?
-                """, (str(guild_id), str(inviter_id))) as cursor:
-                    row = await cursor.fetchone()
-                    joins = row[0] if (row and row[0] is not None) else 0
-                    leaves = row[1] if (row and row[1] is not None) else 0
-                    total_sum = joins - leaves
-                    print(f"[Success] DB updated for User {inviter_id} (Code: {invite_code}), Total: {total_sum}")
-                    return total_sum, joins, leaves, inviter_id, invite_code, True
+                # 누적 가입 인원 합산 조회
+                row = await conn.fetchrow("""
+                    SELECT SUM(join_count) as joins, SUM(leave_count) as leaves FROM referrals
+                    WHERE guild_id = $1 AND user_id = $2
+                """, str(guild_id), str(inviter_id))
+                joins = row['joins'] if (row and row['joins'] is not None) else 0
+                leaves = row['leaves'] if (row and row['leaves'] is not None) else 0
+                total_sum = joins - leaves
+                print(f"[Success] DB updated for User {inviter_id} (Code: {invite_code}), Total: {total_sum}")
+                return total_sum, joins, leaves, inviter_id, invite_code, True
         except Exception as e:
             logger.exception(f"Failed to update database for inviter {inviter_id}")
             return 0, 0, 0, inviter_id, invite_code, True
 
     async def decrement_referrals_db(self, guild_id, member_id):
         """멤버가 나갔을 때 초대한 사람의 추천 수를 1 감소시키고 기록을 유지합니다."""
+        if not self.db_pool:
+            return None
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # 누가 초대했는지 조회
-                async with db.execute("""
-                    SELECT inviter_id, invite_code FROM joined_members
-                    WHERE guild_id = ? AND user_id = ?
-                """, (str(guild_id), str(member_id))) as cursor:
-                    row = await cursor.fetchone()
+            async with self.db_pool.acquire() as conn:
+                async with conn.transaction():
+                    # 누가 초대했는지 조회
+                    row = await conn.fetchrow("""
+                        SELECT inviter_id, invite_code FROM joined_members
+                        WHERE guild_id = $1 AND user_id = $2
+                    """, str(guild_id), str(member_id))
                     if not row:
                         return None
-                    inviter_id, invite_code = row[0], row[1]
+                    inviter_id, invite_code = row['inviter_id'], row['invite_code']
 
-                # 추천 퇴장 수 증가
-                await db.execute("""
-                    UPDATE referrals
-                    SET leave_count = leave_count + 1
-                    WHERE guild_id = ? AND user_id = ? AND invite_code = ?
-                """, (str(guild_id), str(inviter_id), invite_code))
-                await db.commit()
+                    # 추천 퇴장 수 증가
+                    await conn.execute("""
+                        UPDATE referrals
+                        SET leave_count = leave_count + 1
+                        WHERE guild_id = $1 AND user_id = $2 AND invite_code = $3
+                    """, str(guild_id), str(inviter_id), invite_code)
                 
                 # 누적 횟수 조회
-                async with db.execute("""
-                    SELECT SUM(join_count), SUM(leave_count) FROM referrals
-                    WHERE guild_id = ? AND user_id = ?
-                """, (str(guild_id), str(inviter_id))) as cursor:
-                    row = await cursor.fetchone()
-                    joins = row[0] if (row and row[0] is not None) else 0
-                    leaves = row[1] if (row and row[1] is not None) else 0
-                    total_sum = joins - leaves
-                    return {"inviter_id": inviter_id, "total": total_sum, "joins": joins, "leaves": leaves}
+                row = await conn.fetchrow("""
+                    SELECT SUM(join_count) as joins, SUM(leave_count) as leaves FROM referrals
+                    WHERE guild_id = $1 AND user_id = $2
+                """, str(guild_id), str(inviter_id))
+                joins = row['joins'] if (row and row['joins'] is not None) else 0
+                leaves = row['leaves'] if (row and row['leaves'] is not None) else 0
+                total_sum = joins - leaves
+                return {"inviter_id": inviter_id, "total": total_sum, "joins": joins, "leaves": leaves}
         except Exception as e:
             logger.exception(f"Failed to decrement database for member {member_id}")
             return None
 
     async def get_guild_settings(self, guild_id):
         """서버의 로그 설정을 가져옵니다. 설정이 없으면 기본값을 반환합니다."""
+        if not self.db_pool:
+            return {"log_enabled": True, "log_channel_id": None}
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT log_enabled, log_channel_id FROM guild_settings WHERE guild_id = ?", (str(guild_id),)) as cursor:
-                    row = await cursor.fetchone()
-                    if row:
-                        return {"log_enabled": bool(row[0]), "log_channel_id": row[1]}
+            async with self.db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT log_enabled, log_channel_id FROM guild_settings WHERE guild_id = $1", str(guild_id))
+                if row:
+                    return {"log_enabled": bool(row['log_enabled']), "log_channel_id": row['log_channel_id']}
         except Exception as e:
             logger.exception(f"Failed to get guild settings for guild {guild_id}")
         return {"log_enabled": True, "log_channel_id": None}
 
     async def update_guild_settings(self, guild_id, log_enabled, log_channel_id):
         """서버의 로그 설정을 업데이트합니다."""
+        if not self.db_pool:
+            return False
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("""
+            async with self.db_pool.acquire() as conn:
+                await conn.execute("""
                     INSERT INTO guild_settings (guild_id, log_enabled, log_channel_id)
-                    VALUES (?, ?, ?)
+                    VALUES ($1, $2, $3)
                     ON CONFLICT(guild_id)
-                    DO UPDATE SET log_enabled = ?, log_channel_id = ?
-                """, (str(guild_id), 1 if log_enabled else 0, str(log_channel_id) if log_channel_id else None, 1 if log_enabled else 0, str(log_channel_id) if log_channel_id else None))
-                await db.commit()
+                    DO UPDATE SET log_enabled = EXCLUDED.log_enabled, log_channel_id = EXCLUDED.log_channel_id
+                """, str(guild_id), 1 if log_enabled else 0, str(log_channel_id) if log_channel_id else None)
                 return True
         except Exception as e:
             logger.exception(f"Failed to update guild settings for guild {guild_id}")
@@ -232,30 +229,31 @@ class InviteTrackerBot(discord.Client):
 
     async def get_leaderboard(self, guild_id, limit=10, offset=0):
         """서버의 초대 리더보드 데이터를 페이징 처리하여 조회합니다."""
+        if not self.db_pool:
+            return []
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("""
-                    SELECT user_id, SUM(join_count), SUM(leave_count)
+            async with self.db_pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT user_id, SUM(join_count) as joins, SUM(leave_count) as leaves
                     FROM referrals
-                    WHERE guild_id = ?
+                    WHERE guild_id = $1
                     GROUP BY user_id
                     ORDER BY (SUM(join_count) - SUM(leave_count)) DESC, SUM(join_count) DESC
-                    LIMIT ? OFFSET ?
-                """, (str(guild_id), limit, offset)) as cursor:
-                    rows = await cursor.fetchall()
-                    leaderboard = []
-                    for row in rows:
-                        user_id = row[0]
-                        joins = row[1] if row[1] is not None else 0
-                        leaves = row[2] if row[2] is not None else 0
-                        net = joins - leaves
-                        leaderboard.append({
-                            "user_id": user_id,
-                            "joins": joins,
-                            "leaves": leaves,
-                            "net": net
-                        })
-                    return leaderboard
+                    LIMIT $2 OFFSET $3
+                """, str(guild_id), limit, offset)
+                leaderboard = []
+                for row in rows:
+                    user_id = row['user_id']
+                    joins = row['joins'] if row['joins'] is not None else 0
+                    leaves = row['leaves'] if row['leaves'] is not None else 0
+                    net = joins - leaves
+                    leaderboard.append({
+                        "user_id": user_id,
+                        "joins": joins,
+                        "leaves": leaves,
+                        "net": net
+                    })
+                return leaderboard
         except Exception as e:
             logger.exception(f"Failed to fetch leaderboard for guild {guild_id}")
             return []
