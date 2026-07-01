@@ -31,6 +31,20 @@ class InviteTrackerBot(discord.Client):
         self.synced = False
         self.db_pool = None
 
+    async def setup_hook(self):
+        """봇 초기화 시 백그라운드 태스크를 시작합니다."""
+        self._invite_refresh_task = asyncio.ensure_future(self._refresh_invites_loop())
+
+    async def _refresh_invites_loop(self):
+        """1시간마다 초대 캐시를 전체 갱신하여 만료된 코드를 정리합니다."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(3600)  # 1시간 대기
+            logger.info("[Cache] Refreshing invite cache for all guilds...")
+            for guild in self.guilds:
+                await self.cache_invites(guild)
+            logger.info(f"[Cache] Invite cache refresh complete. ({len(self.guilds)} guilds)")
+
     async def initialize_db(self):
         """Supabase PostgreSQL 데이터베이스 및 테이블을 초기화합니다."""
         if not SUPABASE_DB_URL:
@@ -594,6 +608,12 @@ class LeaderboardView(discord.ui.View):
 
         embed.description = "\n\n".join(description_lines)
         return embed, has_next
+
+    async def on_timeout(self):
+        """timeout 후 View를 이벤트 루프에서 제거하여 메모리 누수를 방지합니다."""
+        for item in self.children:
+            item.disabled = True
+        self.stop()
 
     async def update_view(self, interaction: discord.Interaction):
         embed, has_next = await self.generate_embed()
