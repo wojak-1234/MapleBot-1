@@ -379,13 +379,16 @@ class InviteTrackerBot(discord.Client):
                 except ValueError:
                     return
                 
+                # 3초 제한 시간 초과로 인한 Unknown interaction 오류를 방지하기 위해 응답을 지연시킵니다.
+                await interaction.response.defer(ephemeral=True)
+                
                 guild = interaction.guild
                 if not guild:
                     return
                 
                 role = guild.get_role(role_id)
                 if not role:
-                    await interaction.response.send_message("❌ 설정된 역할을 서버에서 찾을 수 없습니다.", ephemeral=True)
+                    await interaction.followup.send("❌ 설정된 역할을 서버에서 찾을 수 없습니다.", ephemeral=True)
                     return
                 
                 # 추가할 역할이 이미 있고, 제거할 역할은 유저에게 없는 경우
@@ -397,7 +400,7 @@ class InviteTrackerBot(discord.Client):
                         has_remove_role = True
 
                 if has_target_role and not has_remove_role:
-                    await interaction.response.send_message(" 이미 역할을 가지고 있습니다.", ephemeral=True)
+                    await interaction.followup.send(" 이미 역할을 가지고 있습니다.", ephemeral=True)
                     return
                 
                 try:
@@ -419,11 +422,11 @@ class InviteTrackerBot(discord.Client):
                     if roles_to_remove:
                         await interaction.user.remove_roles(*roles_to_remove)
                         
-                    await interaction.response.send_message(f"✅ {role.name} 역할이 부여되었습니다{removed_text}. 서버 입장을 환영합니다!", ephemeral=True)
+                    await interaction.followup.send(f"✅ {role.name} 역할이 부여되었습니다{removed_text}. 서버 입장을 환영합니다!", ephemeral=True)
                 except discord.Forbidden:
-                    await interaction.response.send_message("❌ 봇에게 역할 관리 권한이 없습니다. (봇의 역할 순위가 해당 역할들보다 높아야 합니다.)", ephemeral=True)
+                    await interaction.followup.send("❌ 봇에게 역할 관리 권한이 없습니다. (봇의 역할 순위가 해당 역할들보다 높아야 합니다.)", ephemeral=True)
                 except Exception as e:
-                    await interaction.response.send_message(f"❌ 역할 처리 중 오류가 발생했습니다: {e}", ephemeral=True)
+                    await interaction.followup.send(f"❌ 역할 처리 중 오류가 발생했습니다: {e}", ephemeral=True)
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         # 파라미터 변환 오류 (TransformerError)
